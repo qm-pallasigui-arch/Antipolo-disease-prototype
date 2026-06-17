@@ -33,6 +33,8 @@ import pandas as pd
 import plotly.graph_objects as go
 from statsmodels.tsa.statespace.sarimax import SARIMAX
 from statsmodels.tsa.seasonal import seasonal_decompose
+from statsmodels.tsa.stattools import adfuller
+from statsmodels.tools.sm_exceptions import ConvergenceWarning
 
 from dash import (
     Dash, dcc, html, Input, Output, State,
@@ -148,37 +150,54 @@ def get_monthly_series(df: pd.DataFrame,
 
 def run_arima(series: pd.Series, forecast_steps: int = 24):
     """
-    Fits ARIMA(1,1,1) on the monthly series and returns:
-      - fitted values
-      - forecast values
-      - 95% confidence interval (lower, upper)
-    Falls back to simpler model if fitting fails.
+    Tiered model selection based on series length:
+      >= 3 seasons (36 months): SARIMA(1,1,1)(1,1,1)[12] — captures annual cycle
+      <  3 seasons            : ARIMA(1,1,1) — too short for seasonal estimation
+    d is always fixed to 1 (disease count series are non-stationary by nature).
+    Falls back one tier down if fitting fails; last resort is drift forecast.
     """
+    def _fit_and_forecast(order, seasonal_order):
+        with warnings.catch_warnings():
+            warnings.filterwarnings("error", category=ConvergenceWarning)
+            m = SARIMAX(
+                series, order=order, seasonal_order=seasonal_order,
+                trend="c", enforce_stationarity=False, enforce_invertibility=False,
+            )
+            r = m.fit(disp=False, maxiter=300)
+        pred    = r.get_forecast(steps=forecast_steps)
+        fc_mean = pred.predicted_mean
+        fc_ci   = pred.conf_int(alpha=0.05)
+        cols    = fc_ci.columns.tolist()
+        return r.fittedvalues, fc_mean, fc_ci[cols[0]], fc_ci[cols[1]]
+
+    # Tier 1: SARIMA(1,1,1)(0,1,1)[12] — captures 12-month seasonal cycle
+    if len(series) >= 36:
+        try:
+            return _fit_and_forecast((1, 1, 1), (0, 1, 1, 12))
+        except Exception:
+            pass
+
+    # Tier 2: plain ARIMA(1,1,1) — no seasonal component
     try:
-        model  = SARIMAX(series, order=(1, 1, 1), trend="c")
-        result = model.fit(disp=False)
-        fitted = result.fittedvalues
-
-        pred   = result.get_forecast(steps=forecast_steps)
-        fc_mean  = pred.predicted_mean
-        fc_ci    = pred.conf_int(alpha=0.05)
-        return fitted, fc_mean, fc_ci["lower cases"], fc_ci["upper cases"]
-
+        return _fit_and_forecast((1, 1, 1), (0, 0, 0, 0))
     except Exception:
-        # Fallback: naive drift forecast
-        last_val = series.iloc[-1]
-        drift    = (series.iloc[-1] - series.iloc[0]) / len(series)
-        idx      = pd.date_range(
-            series.index[-1] + pd.DateOffset(months=1),
-            periods=forecast_steps, freq="MS"
-        )
-        fc_mean  = pd.Series(
-            [max(last_val + drift * i, 0) for i in range(1, forecast_steps + 1)],
-            index=idx
-        )
-        fc_lower = fc_mean * 0.75
-        fc_upper = fc_mean * 1.25
-        return series, fc_mean, fc_lower, fc_upper
+        pass
+
+    # Tier 3: naive drift forecast with historical ±1.96σ CI
+    last_val = series.iloc[-1]
+    drift    = (series.iloc[-1] - series.iloc[0]) / len(series)
+    std      = series.std()
+    idx      = pd.date_range(
+        series.index[-1] + pd.DateOffset(months=1),
+        periods=forecast_steps, freq="MS"
+    )
+    fc_mean  = pd.Series(
+        [max(last_val + drift * i, 0) for i in range(1, forecast_steps + 1)],
+        index=idx
+    )
+    fc_lower = (fc_mean - 1.96 * std).clip(lower=0)
+    fc_upper = fc_mean + 1.96 * std
+    return series, fc_mean, fc_lower, fc_upper
 
 
 def run_decomposition(series: pd.Series):
@@ -556,9 +575,9 @@ app.layout = html.Div([
     }),
 
     # ── Annual trend + ARIMA ──────────────────────────────────────────────
-    section("Time series — ARIMA model (live)"),
+    section("Time series — SARIMA model (live)"),
     html.Div([
-        html.P("Monthly disease incidence with ARIMA(1,1,1) fit and 24-month forecast",
+        html.P("Monthly disease incidence with SARIMA(1,d,1)(1,1,1)[12] fit and 24-month forecast",
                style=S_CHART_TITLE),
         html.P("Fitted values (green dotted) show model accuracy · "
                "Shaded band = 95% confidence interval · "
